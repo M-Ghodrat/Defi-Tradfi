@@ -1,29 +1,14 @@
 import streamlit as st
-import pandas as pd
 
-from logic.data_loader import load_csv
-from logic.stationarity import run_stationarity_tests
-from logic.var_model import run_var_model
-from logic.network import build_network
-from plots.plot_stationarity import plot_stationarity_table
-from plots.plot_var import plot_lag_selection, plot_residual_normality, plot_var_stability
-from plots.plot_network import plot_network_graph
-from utils.helpers import calculate_features, calculate_distress
+st.set_page_config(page_title="DeFi & TradFi Contagion Dashboard", layout="wide")
 
-st.title("DeFi & TradFi Contagion Risk Dashboard")
+from data_loader import load_and_process_data
+from var_analysis import fit_var_model, compute_fevd, get_lag_selection_df
+from network_viz import build_network, draw_enhanced_network
+from distress_model import compute_distress_probability
+from stationarity import run_stationarity_tests, run_residual_normality
 
-# ---- File uploader ----
-uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"])
-if uploaded_file is None:
-    st.info("Please upload a CSV file to proceed.")
-    st.stop()
-
-# ---- Load data ----
-df = load_csv(uploaded_file)
-st.success("File uploaded successfully!")
-st.write(df.head())
-
-# ---- Sidebar controls ----
+# --- Sidebar controls ---
 st.sidebar.header("📊 Model Parameters")
 smooth_window = st.sidebar.slider("Rolling smoothing window (days)", 1, 10, 3)
 max_lags = st.sidebar.slider("VAR model maximum number of lags", 1, 40, 15)
@@ -37,59 +22,86 @@ threshold_percentile = st.sidebar.slider("Percentile threshold (%)", 50, 99, 95)
 st.sidebar.header("📈 Distress Prediction")
 lookahead_days = st.sidebar.slider("Lookahead window (days)", 3, 30, 14)
 
-# ---- Feature calculation ----
-ts_df, data = calculate_features(df, smooth_window)
+# --- File Upload ---
+uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"])
 
-# ---- Stationarity Tests ----
-stat_df = run_stationarity_tests(ts_df)
+if uploaded_file is None:
+    st.info("Please upload a CSV file to proceed.")
+    st.stop()
 
-# ---- VAR Model ----
-var_fitted, lag_df = run_var_model(ts_df, max_lags)
+# --- Load & Process Data (CACHED) ---
+# Read file content as string so it can be cached properly
+file_content = uploaded_file.getvalue().decode("utf-8")
+data, ts_df = load_and_process_data(file_content, smooth_window)
+st.success("File uploaded and processed!")
 
-# ---- FEVD ----
-adj_pct, adj = var_fitted.fevd(fevd_horizon).decomp.mean(axis=1) * 100, var_fitted.fevd(fevd_horizon).decomp.mean(axis=1)
-
-# ---- Threshold & Network ----
-G, title_label = build_network(adj, ts_df.columns.tolist(), threshold_mode, threshold_value, threshold_percentile)
-
-# ---- Tabs ----
+# --- Tabs ---
 tabs = st.tabs([
-    "FEVD Table", "Stationarity Tests", "Contagion Network",
+    "FEVD Table", "Stationarity Tests", "Contagion Network", 
     "Lag Selection", "Residual Normality", "VAR Stability", "Distress Probability"
 ])
 
-# --- FEVD Table ---
-with tabs[0]:
+# Only compute what's needed per tab (lazy evaluation)
+with tabs[0]:  # FEVD Table
     st.subheader("FEVD Adjacency Table")
-    df_table = pd.DataFrame(adj_pct, index=ts_df.columns, columns=ts_df.columns)
-    st.dataframe(df_table)
+    var_fitted = fit_var_model(ts_df, max_lags)
+    adj, adj_pct = compute_fevd(var_fitted, fevd_horizon)
+    st.dataframe(adj_pct)
 
-# --- Stationarity Tests ---
-with tabs[1]:
+with tabs[1]:  # Stationarity
     st.subheader("Stationarity Tests (ADF & KPSS)")
-    plot_stationarity_table(stat_df)
+    stat_df = run_stationarity_tests(ts_df)
+    st.dataframe(stat_df)
 
-# --- Network Graph ---
-with tabs[2]:
+with tabs[2]:  # Network
     st.subheader("Contagion Network Graph")
-    plot_network_graph(G, fevd_horizon, title_label)
+    var_fitted = fit_var_model(ts_df, max_lags)
+    adj, _ = compute_fevd(var_fitted, fevd_horizon)
+    threshold = threshold_value if threshold_mode == 'fixed' else None
+    percentile = threshold_percentile if threshold_mode == 'percentile' else None
+    G, title_label = build_network(ts_df.columns.tolist(), adj, threshold, percentile)
+    fig = draw_enhanced_network(G, fevd_horizon, title_label)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.pyplot(fig, use_container_width=False)
 
-# --- Lag Selection ---
-with tabs[3]:
-    st.subheader("VAR Lag Selection Criteria")
-    plot_lag_selection(lag_df)
+with tabs[3]:  # Lag Selection
+    st.subheader("Lag Selection Criteria")
+    lag_df = get_lag_selection_df(ts_df, max_lags)
+    if lag_df is not None:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(6.5, 3))
+        ax.plot(lag_df.index, lag_df["AIC"], marker='o', label='AIC')
+        ax.plot(lag_df.index, lag_df["BIC"], marker='s', label='BIC')
+        ax.plot(lag_df.index, lag_df["HQIC"], marker='^', label='HQIC')
+        ax.set_xlabel("Lag Length")
+        ax.set_ylabel("Criterion Value")
+        ax.legend()
+        ax.grid(alpha=0.3, linestyle='--')
+        st.pyplot(fig)
 
-# --- Residual Normality ---
-with tabs[4]:
+with tabs[4]:  # Residual Normality
     st.subheader("Residual Normality (Jarque–Bera)")
-    plot_residual_normality(var_fitted)
+    var_fitted = fit_var_model(ts_df, max_lags)
+    jb_df = run_residual_normality(var_fitted)
+    st.dataframe(jb_df)
 
-# --- VAR Stability ---
-with tabs[5]:
+with tabs[5]:  # VAR Stability
     st.subheader("VAR Model Stability (Eigenvalues)")
-    plot_var_stability(var_fitted)
+    var_fitted = fit_var_model(ts_df, max_lags)
+    import numpy as np
+    import pandas as pd
+    eigvals = var_fitted.roots
+    modulus = np.abs(eigvals)
+    eig_df = pd.DataFrame({'Eigenvalue': eigvals, 'Modulus': modulus, 'Stable?': modulus < 1})
+    st.dataframe(eig_df)
+    if np.all(modulus < 1):
+        st.success("VAR model is STABLE ✅")
+    else:
+        st.error("VAR model is NOT stable ❌")
 
-# --- Distress Probability ---
-with tabs[6]:
+with tabs[6]:  # Distress
     st.subheader("Distress Probability (Biweekly)")
-    calculate_distress(data, lookahead_days)
+    fig = compute_distress_probability(data, lookahead_days)
+    if fig:
+        st.pyplot(fig)
